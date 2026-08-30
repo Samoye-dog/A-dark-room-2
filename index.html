@@ -917,6 +917,17 @@ div.perkRow .row_key {
     
 }
 
+/* ===== 发电站剧本: 柴油发电机被搬走后, 地图上的 E 标记置灰 ===== */
+#map .landmark.depleted,
+#mapInner .landmark.depleted {
+        color: #999 !important;
+}
+
+#miniMap .mm-land.mm-depleted,
+#miniMapExpanded .mm-land.mm-depleted {
+        color: #999;
+}
+
 #bagspace-world {
         border: 1px solid black;
         height: 62px;
@@ -3072,6 +3083,12 @@ _.setTranslation({
     "village": "村庄",
     "pop {0}/{1}": "村民 {0}/{1}",
     "pop ": "村民 ",
+
+    // ================== 发电站剧本 (Power Station) ==================
+    "diesel": "柴油",
+    "diesel generator": "柴油发电机",
+    "power plant": "发电厂",
+    "not enough diesel": "柴油不够了",
 });
         </script>
         <script>
@@ -6947,6 +6964,25 @@ var Room = {
                                 };
                         }
                 },
+                // ⚠️ 发电站剧本·阶段三: 发电厂 (排在兵工厂后面; 需要先把柴油发电机运回村庄才会出现建造选项)
+                // 注: 取得发电机 3 分钟后, PowerStation.unlockPowerPlant() 会设置 game.buildings["diesel generator"] = 1
+                // 并通过 notify(null,...) 显示建造者台词, 因此这里不设 availableMsg 以免重复弹台词
+                'power plant': {
+                        name: _('power plant'),
+                        button: null,
+                        maximum: 1,
+                        buildMsg: _('建造者将最后一根电缆接上, 合上了电闸, 整个小屋瞬间被柔和的白光笼罩.'),
+                        type: 'building',
+                        cost: function() {
+                                return {
+                                        'steel': 1500,
+                                        'iron': 2500,
+                                        'wood': 2000,
+                                        'alien alloy': 1,
+                                        'sulphur': 600
+                                };
+                        }
+                },
                 'torch': {
                         name: _('torch'),
                         button: null,
@@ -7270,10 +7306,21 @@ var Room = {
                         type: 'upgrade',
                         maximum: 1,
                         cost: function() {
-                                return { 
-                                        fur: 400, 
-                                        scales: 20, 
-                                        teeth: 10 
+                                return {
+                                        fur: 400,
+                                        scales: 20,
+                                        teeth: 10
+                                };
+                        }
+                },
+                // ⚠️ 发电站剧本: 柴油交易 (拿到柴油发电机并库存出现柴油后, 购买选项自动解锁)
+                // 注: 不设 buildMsg → Room.buy() 中的 Notifications.notify(Room, good.buildMsg) 会因 undefined 提前返回, 左边不显示任何提示
+                'diesel': {
+                        type: 'good',
+                        cost: function() {
+                                return {
+                                        'scales': 100,
+                                        'fur': 500
                                 };
                         }
                 }
@@ -7824,6 +7871,10 @@ var Room = {
         },
         
         craftUnlocked: function(thing) {
+                // ⚠️ 发电站剧本: 【发电厂】建造选项 = 必须先把柴油发电机运回村庄 (村庄建筑 柴油发电机 ≥ 1)
+                if(thing == 'power plant' && !$SM.get('game.buildings["diesel generator"]', true)) {
+                        return false;
+                }
                 if(Room.buttons[thing]) {
                         return true;
                 }
@@ -8630,7 +8681,8 @@ var World = {
                 BOREHOLE: 'B',
                 BATTLEFIELD: 'F',
                 SWAMP: 'M',
-    CACHE: 'U'
+    CACHE: 'U',
+    POWER_STATION: 'E'   // ⚠️ 发电站剧本: 废弃发电站 (停电事件后动态放置在村庄北面 5 格)
         },
         TILE_PROBS: {},
         LANDMARKS: {},
@@ -8831,6 +8883,8 @@ var World = {
                 World.LANDMARKS[World.TILE.BOREHOLE]    = { num: Math.round(10 * SF),                         minRadius: Math.round(15 * SF),                     maxRadius: Math.floor(World.RADIUS * 1.5),          scene: 'borehole',     label:  _('A Borehole')};
                 World.LANDMARKS[World.TILE.BATTLEFIELD] = { num: Math.round(5 * SF),                          minRadius: Math.round(18 * SF),                     maxRadius: Math.floor(World.RADIUS * 1.5),          scene: 'battlefield',  label:  _('A Forgotten Battlefield')};
                 World.LANDMARKS[World.TILE.SWAMP]       = { num: 1,                                            minRadius: Math.round(15 * SF),                     maxRadius: Math.floor(World.RADIUS * 1.5),          scene: 'swamp',        label:  _('A Murky Swamp')};
+                // ⚠️ 发电站剧本: E = 废弃发电站 (num:0 → 不在生成地图时出现, 由 PowerStation.placeOnMap 在停电事件后动态放置)
+                World.LANDMARKS[World.TILE.POWER_STATION] = { num: 0,                                          minRadius: 0,                                       maxRadius: 0,                                       scene: 'powerstation', label: _('废弃的发电站') };
                 
                 // Only add the cache if there is prestige data
                 if($SM.get('previous.stores')) {
@@ -9530,7 +9584,9 @@ var World = {
                                                         break;
                                                 default:
                                                         if(typeof World.LANDMARKS[c] != 'undefined' && (c != World.TILE.OUTPOST || !World.outpostUsed(i, j))) {
-                                                                mapString += '<span class="landmark">' + c + '<div class="tooltip' + ttClass + '">' + World.LANDMARKS[c].label + '</div></span>';
+                                                                // ⚠️ 发电站剧本: 柴油发电机被搬走后, E 置灰显示
+                                                                var _psDead = (c === World.TILE.POWER_STATION && $SM.get('game.powerStation.generatorObtained', true));
+                                                                mapString += '<span class="landmark' + (_psDead ? ' depleted' : '') + '">' + c + '<div class="tooltip' + ttClass + '">' + (_psDead ? _('废弃的发电站 (已清空)') : World.LANDMARKS[c].label) + '</div></span>';
                                                         } else {
                                                                 if(c && c.length > 1) {
                                                                         c = c[0];
@@ -9663,7 +9719,12 @@ var World = {
                                 Path.outfit[k] = 0;
                         }
                 }
-                
+
+                // ⚠️ 发电站剧本: 带着柴油发电机安全回到家 → 左边输出建造者台词 + 解锁【安全归来】成就
+                if (typeof PowerStation !== 'undefined') {
+                        PowerStation.onGoHome();
+                }
+
                 $('#outerSlider').animate({left: '0px'}, 300);
                 Engine.activeModule = Path;
                 Path.onArrival();
@@ -10219,7 +10280,8 @@ var World = {
                                 sp.className = 'mm-outpost';
                                 sp.textContent = World.TILE.OUTPOST;
                         } else {
-                                sp.className = 'mm-land';
+                                // ⚠️ 发电站剧本: 柴油发电机被搬走后, E 置灰
+                                sp.className = 'mm-land' + ((ch === World.TILE.POWER_STATION && $SM.get('game.powerStation.generatorObtained', true)) ? ' mm-depleted' : '');
                                 sp.textContent = ch;
                         }
                         sp.style.left = (i * sx) + 'px';
@@ -10312,7 +10374,8 @@ var World = {
                                                         sp.className = 'mm-outpost';
                                                         sp.textContent = World.TILE.OUTPOST;
                                                 } else {
-                                                        sp.className = 'mm-land';
+                                                        // ⚠️ 发电站剧本: 柴油发电机被搬走后, E 置灰
+                                                        sp.className = 'mm-land' + ((ch === World.TILE.POWER_STATION && $SM.get('game.powerStation.generatorObtained', true)) ? ' mm-depleted' : '');
                                                         sp.textContent = ch;
                                                 }
                                                 sp.style.left = (i * sx) + 'px';
@@ -10336,7 +10399,8 @@ var World = {
                                         sp.className = 'mm-outpost';
                                         sp.textContent = World.TILE.OUTPOST;
                                 } else {
-                                        sp.className = 'mm-land';
+                                        // ⚠️ 发电站剧本: 柴油发电机被搬走后, E 置灰
+                                        sp.className = 'mm-land' + ((ch === World.TILE.POWER_STATION && $SM.get('game.powerStation.generatorObtained', true)) ? ' mm-depleted' : '');
                                         sp.textContent = ch;
                                 }
                                 sp.style.left = (i * sx) + 'px';
@@ -13117,6 +13181,126 @@ Events.Encounters = [
  * Events that only occur at specific times. Launched manually.
  **/
 Events.Setpieces = {
+        "powerstation": { /* ⚠️ 发电站剧本·阶段二: 废弃的发电站 (E 地标, 停电事件后才出现在地图上) */
+                title: _('废弃的发电站'),
+                scenes: {
+                        // ---------- 大门口 ----------
+                        'start': {
+                                notification: _('你抵达了镇子边的废弃发电站'),
+                                onLoad: function() {
+                                        var s = Events.Setpieces.powerstation.scenes.start;
+                                        if ($SM.get('game.powerStation.generatorObtained', true)) {
+                                                // 柴油发电机已被搬走 → 空场景 (E 在地图上显示为灰色)
+                                                s.text = [
+                                                        _('大厅里空空荡荡, 已经被拾荒者光顾过了.'),
+                                                        _('只剩下穿堂风吹过破裂管道的呜呜声.')
+                                                ];
+                                                s.buttons = {
+                                                        'ps_leave': { text: _('离开'), nextScene: 'end' }
+                                                };
+                                        } else {
+                                                s.text = [
+                                                        _('发电站内部一片狼藉, 管道破裂, 墙壁上爬满了铁锈.')
+                                                ];
+                                                s.buttons = {
+                                                        'ps_enter': { text: _('进入'), nextScene: {1: 'inner'} },
+                                                        'ps_leave': { text: _('离开'), nextScene: 'end' }
+                                                };
+                                        }
+                                },
+                                buttons: {
+                                        'ps_enter': { text: _('进入'), nextScene: {1: 'inner'} },
+                                        'ps_leave': { text: _('离开'), nextScene: 'end' }
+                                }
+                        },
+                        // ---------- 主机房外 (从这里开始不能再回头) ----------
+                        'inner': {
+                                text: [
+                                        _('突然, 主机房深处传来某种沉重的呼吸声……')
+                                ],
+                                buttons: {
+                                        'ps_enter2': { text: _('进入'), nextScene: {1: 'fight1'} }
+                                }
+                        },
+                        // ---------- 战斗一: 变异巨鼠 (血量较厚, 少量毛皮和鳞片) ----------
+                        'fight1': {
+                                combat: true,
+                                enemy: 'mutant giant rat',
+                                enemyName: _('变异巨鼠'),
+                                deathMessage: _('变异巨鼠轰然倒地, 抽搐了两下, 不再动弹.'),
+                                chara: 'R',
+                                damage: 5,
+                                hit: 0.8,
+                                attackDelay: 2,
+                                health: 80,
+                                loot: {
+                                        'fur': {
+                                                min: 2,
+                                                max: 5,
+                                                chance: 1
+                                        },
+                                        'scales': {
+                                                min: 2,
+                                                max: 4,
+                                                chance: 1
+                                        }
+                                },
+                                notification: _('一只浑身溃烂的变异巨鼠从配电箱后面扑了出来'),
+                                buttons: {
+                                        // 战斗中不能离开 (没有逃跑按钮)
+                                        'ps_continue1': { text: _('继续深入'), nextScene: {1: 'fight2'} }
+                                }
+                        },
+                        // ---------- 战斗二: 一群变异老鼠 (血量超级厚, 20+ 毛皮和鳞片) ----------
+                        'fight2': {
+                                combat: true,
+                                enemy: 'mutant rat swarm',
+                                enemyName: _('一群变异老鼠'),
+                                deathMessage: _('最后一只变异老鼠也被你清剿掉了.'),
+                                chara: 'R',
+                                damage: 6,
+                                hit: 0.8,
+                                attackDelay: 2,
+                                health: 150,
+                                loot: {
+                                        'fur': {
+                                                min: 20,
+                                                max: 30,
+                                                chance: 1
+                                        },
+                                        'scales': {
+                                                min: 20,
+                                                max: 30,
+                                                chance: 1
+                                        }
+                                },
+                                notification: _('黑暗中亮起几十双猩红的小眼睛——是一群变异老鼠'),
+                                buttons: {
+                                        'ps_continue2': { text: _('继续'), nextScene: {1: 'generator'} }
+                                }
+                        },
+                        // ---------- 战后剧情: 柴油发电机 ----------
+                        'generator': {
+                                text: [
+                                        _('推开大门, 眼前的景象让你屏住了呼吸.'),
+                                        _('一台巨大的柴油发电机和几十桶柴油安静地伫立在房间中央.'),
+                                        _('机身蒙着一层薄灰, 但整体保存完好.')
+                                ],
+                                notification: _('柴油发电机和柴油已经放在货车上了'),
+                                buttons: {
+                                        'ps_confirm': {
+                                                text: _('确认'),
+                                                onChoose: function() {
+                                                        if (typeof PowerStation !== 'undefined') {
+                                                                PowerStation.claimGenerator();
+                                                        }
+                                                },
+                                                nextScene: 'end'
+                                        }
+                                }
+                        }
+                }
+        },
         "outpost": { /* Friendly Outpost */
                 title: _('An Outpost'),
                 scenes: {
@@ -16856,7 +17040,14 @@ var Achievements = {
         // 七、星际诈骗犯剧情 (Alien Scammer storyline) — no confetti per user spec
         'interstellar_victim':  { title: '星际诈骗受害者，第一次跟外星人交易一无所获！', subtitle: '',                          rewards: {},            confetti: 0 },
         'gamblers_victory':     { title: '赌徒的胜利，两次跟外星人交易成功！',           subtitle: '外星合金已到账。',         rewards: {},            confetti: 0 },
-        'interstellar_leek':    { title: '星际韭菜，两次跟外星人交易失败！',             subtitle: '钢 +10（辛苦费）',         rewards: {'steel': 10}, confetti: 0 }
+        'interstellar_leek':    { title: '星际韭菜，两次跟外星人交易失败！',             subtitle: '钢 +10（辛苦费）',         rewards: {'steel': 10}, confetti: 0 },
+
+        // 八、发电站剧情 (Power Station storyline)
+        //    前 3 个成就的柴油奖励在解锁时随机抽取 2~6 桶 (由 PowerStation.unlockWithDiesel 动态写入)
+        'power_generator_found': { title: '电力先锋，把柴油发电机运回了村庄！', subtitle: '柴油 +2~6',                        rewards: {} },
+        'power_diesel_trade':    { title: '电力商人，贸易栈可以兑换柴油了！',   subtitle: '柴油 +2~6',                        rewards: {} },
+        'power_safe_return':     { title: '安全归来，带着柴油发电机回到了家！', subtitle: '柴油 +2~6，外星合金 +1，钢 +100', rewards: {} },
+        'build_power_plant':     { title: '建造能手，建造了发电厂！',           subtitle: '钢 +200，木头 +200，硫磺 +300',    rewards: {'steel': 200, 'wood': 200, 'sulphur': 300} }
     },
 
     // Map building key → achievement id
@@ -16870,7 +17061,8 @@ var Achievements = {
         'smokehouse': 'build_smokehouse',
         'workshop': 'build_workshop',
         'steelworks': 'build_steelworks',
-        'armoury': 'build_armoury'
+        'armoury': 'build_armoury',
+        'power plant': 'build_power_plant'
     },
 
     // Map craftable key → achievement id
@@ -17122,6 +17314,358 @@ if (typeof $ !== 'undefined') {
     $(function(){
         if (typeof $SM !== 'undefined') {
             Achievements.init();
+        }
+    });
+}
+</script>
+
+<!-- ===== 发电站剧本 (Power Station Storyline) ===== -->
+<script data-source="script/power_station.js">
+/**
+ * ═══════════════════════════════════════════════════════════════════
+ *  发电站剧本 — 完整三阶段事件链
+ *
+ *  阶段一【停电危机】
+ *    触发条件: 已有罗盘 + 10 座基础建筑全部建造 + 资源达标,
+ *             且正在小黑屋(Room)挂机, 无其他弹窗占用
+ *    触发方式: 每 3 分钟检查一次, 50% 概率命中 → 三连弹窗
+ *
+ *  阶段二【寻找发电机】
+ *    停电事件完成后, 探险地图上村庄正北 5 格处标记 E (废弃发电站)
+ *    发电站可以反复触发; 战斗中不能离开; 拿到柴油发电机后 E 置灰
+ *
+ *  阶段三【建造发电站】
+ *    柴油发电机安全运回村庄后 → 小屋解锁【发电厂】建造选项
+ *    (排在兵工厂后面), 建成后解锁成就【建造能手】
+ *
+ *  状态位 ($SM 路径):
+ *    game.powerStation.blackoutDone      — 停电事件已触发 (E 已落图)
+ *    game.powerStation.generatorObtained — 柴油发电机已到手 (E 置灰)
+ *    game.powerStation.safeReturnDone    — 已带着发电机安全回到家
+ * ═══════════════════════════════════════════════════════════════════
+ */
+var PowerStation = {
+
+    // ── 阶段一: 触发参数 ──
+    CHECK_INTERVAL: 3 * 60 * 1000,  // 每 3 分钟检查一次
+    TRIGGER_CHANCE: 0.5,            // 每次检查 50% 概率命中
+    OFFSET: [0, -5],                // E 位于村庄 (A) 正北 5 格
+
+    // ── 阶段二→三: 取得发电机后延迟 3 分钟才解锁发电厂建造选项 + 显示建造者台词 ──
+    UNLOCK_DELAY: 3 * 60 * 1000,    // 取得发电机后 3 分钟
+
+    // 必须已建造的全部基础建筑
+    BASIC_BUILDINGS: [
+        'trap', 'cart', 'hut', 'lodge', 'trading post', 'tannery',
+        'smokehouse', 'workshop', 'steelworks', 'armoury'
+    ],
+
+    // 资源门槛 (资源到达一定的数量)
+    RESOURCE_REQ: {
+        'wood': 1000,
+        'fur': 600,
+        'meat': 600,
+        'iron': 1000,
+        'coal': 500,
+        'steel': 500,
+        'sulphur': 200
+    },
+
+    _timer: null,
+
+    init: function() {
+        if (PowerStation._timer) return;
+        PowerStation._timer = setInterval(PowerStation.tick, PowerStation.CHECK_INTERVAL);
+        // 恢复 3 分钟延迟: 如果已取得发电机但发电厂尚未解锁 (页面刷新场景), 重启定时器
+        if ($SM.get('game.powerStation.generatorObtained', true)
+            && !$SM.get('game.buildings["diesel generator"]', true)) {
+            PowerStation.schedulePowerPlantUnlock();
+        }
+    },
+
+    // E 的世界坐标
+    ePos: function() {
+        return [
+            World.VILLAGE_POS[0] + PowerStation.OFFSET[0],
+            World.VILLAGE_POS[1] + PowerStation.OFFSET[1]
+        ];
+    },
+
+    // ── 阶段一: 触发条件检查 ──
+    conditionsMet: function() {
+        try {
+            if (typeof Engine === 'undefined' || typeof Room === 'undefined') return false;
+            // 必须在小黑屋挂机时触发
+            if (Engine.activeModule !== Room) return false;
+            // 不能有其他弹窗占用
+            if (typeof Events !== 'undefined' && Events.activeEvent()) return false;
+            // 停电事件只能触发一次
+            if ($SM.get('game.powerStation.blackoutDone', true)) return false;
+            // 已经有罗盘
+            if ($SM.get('stores.compass', true) <= 0) return false;
+            // 所有基础建筑全部建造
+            for (var i = 0; i < PowerStation.BASIC_BUILDINGS.length; i++) {
+                var b = PowerStation.BASIC_BUILDINGS[i];
+                if ($SM.get('game.buildings["' + b + '"]', true) < 1) return false;
+            }
+            // 资源达到一定的数量
+            for (var k in PowerStation.RESOURCE_REQ) {
+                if ($SM.get('stores["' + k + '"]', true) < PowerStation.RESOURCE_REQ[k]) return false;
+            }
+            return true;
+        } catch (e) {
+            return false;
+        }
+    },
+
+    // ── 阶段一: 每 3 分钟的心跳检查 ──
+    tick: function() {
+        try {
+            if (!PowerStation.conditionsMet()) return;
+            if (Math.random() > PowerStation.TRIGGER_CHANCE) return; // 50% 概率
+            if (Events.activeEvent()) return;
+            Events.startEvent(Events.BlackoutEvent);
+        } catch (e) {
+            if (typeof console !== 'undefined' && console.error) {
+                console.error('PowerStation.tick error:', e);
+            }
+        }
+    },
+
+    // ── 阶段一收尾: 标记完成 + 在地图上放置 E ──
+    completeBlackout: function() {
+        try {
+            if ($SM.get('game.powerStation.blackoutDone', true)) return;
+            $SM.set('game.powerStation.blackoutDone', true);
+            PowerStation.placeOnMap();
+            Notifications.notify(null, _('建造者告诉你村子旁边有一个废弃发电站, 可以到那里看看.'));
+        } catch (e) {
+            if (typeof console !== 'undefined' && console.error) {
+                console.error('PowerStation.completeBlackout error:', e);
+            }
+        }
+    },
+
+    // ── 阶段一→二: 把 E 写入持久化地图 (村庄正北 5 格) ──
+    placeOnMap: function() {
+        try {
+            var pos = PowerStation.ePos();
+            var x = pos[0], y = pos[1];
+            var changed = false;
+
+            // 1) 修改存档中的压缩地图 (小黑屋挂机时 World.state 为 null)
+            var saved = $SM.get('game.world') || {};
+            if (saved.compressed && saved.mapC) {
+                var map = World.decompressMap(saved.mapC, saved.visited);
+                var mask = World.decompressMask(saved.maskC);
+                if (map[x] && map[x][y]) {
+                    map[x][y] = World.TILE.POWER_STATION;
+                    // 只揭开 E 自己一格 (旁边的迷雾保持不动, 玩家需要走过去才能看清周边)
+                    World.uncoverMap(x, y, 0, mask);
+                    saved.mapC = World.compressMap(map);
+                    saved.maskC = World.compressMask(mask);
+                    saved.visited = saved.visited || {};
+                    if (!saved.discoveredLandmarks) saved.discoveredLandmarks = {};
+                    saved.discoveredLandmarks[x + ',' + y] = World.TILE.POWER_STATION;
+                    // World.handleStateUpdates 为空函数, 触发更新是安全的; 顺便落盘存档
+                    $SM.setM('game.world', saved);
+                    changed = true;
+                }
+            } else if (saved.map) {
+                // 兼容极旧的未压缩存档
+                if (saved.map[x] && saved.map[x][y]) {
+                    saved.map[x][y] = World.TILE.POWER_STATION;
+                    if (saved.mask) saved.mask[x][y] = true;
+                    $SM.setM('game.world', saved);
+                    changed = true;
+                }
+            }
+
+            // 2) 探索中兜底 (停电只在室内触发, 此分支正常不会走到)
+            if (World.state && World.state.map && World.state.map[x] && World.state.map[x][y]) {
+                World.state.map[x][y] = World.TILE.POWER_STATION;
+                // 只揭开 E 自己一格 (旁边的迷雾保持不动)
+                World.uncoverMap(x, y, 0, World.state.mask);
+                if (!World.state.discoveredLandmarks) World.state.discoveredLandmarks = {};
+                World.state.discoveredLandmarks[x + ',' + y] = World.TILE.POWER_STATION;
+                World.drawMap();
+                if (typeof World.buildMiniMap === 'function') World.buildMiniMap();
+            }
+            return changed;
+        } catch (e) {
+            if (typeof console !== 'undefined' && console.error) {
+                console.error('PowerStation.placeOnMap error:', e);
+            }
+            return false;
+        }
+    },
+
+    // ── 阶段二收尾: 点击【确认】后发放部分奖励 + 启动 3 分钟延迟解锁发电厂建造 ──
+    claimGenerator: function() {
+        try {
+            if ($SM.get('game.powerStation.generatorObtained', true)) return;
+            $SM.set('game.powerStation.generatorObtained', true);
+            // 记录取得时间戳, 用于刷新页面后恢复 3 分钟延迟
+            $SM.set('game.powerStation.generatorObtainedAt', Date.now());
+
+            // 1) 库存增加 100 桶【柴油】
+            $SM.add('stores["diesel"]', 100);
+
+            // 2) 成就【电力先锋】(奖励: 柴油 2~6 桶, 随机)
+            PowerStation.unlockWithDiesel('power_generator_found');
+
+            // 3) 商店解锁柴油兑换 (100 鳞片 + 500 毛皮 → 1 柴油) + 成就【电力商人】(奖励: 柴油 2~6 桶)
+            PowerStation.unlockWithDiesel('power_diesel_trade');
+
+            // 4) 3 分钟后才解锁村庄建筑【柴油发电机】+ 显示建造者台词
+            //    在此之前发电厂建造按钮不会出现, 也不会显示该台词
+            PowerStation.schedulePowerPlantUnlock();
+        } catch (e) {
+            if (typeof console !== 'undefined' && console.error) {
+                console.error('PowerStation.claimGenerator error:', e);
+            }
+        }
+    },
+
+    // ── 阶段二→三: 排定 3 分钟后解锁发电厂建造选项 ──
+    // 兼容刷新页面: 用 generatorObtainedAt 时间戳计算剩余等待时间
+    schedulePowerPlantUnlock: function() {
+        try {
+            // 已经解锁过就不再重复
+            if ($SM.get('game.buildings["diesel generator"]', true)) return;
+            var claimedAt = $SM.get('game.powerStation.generatorObtainedAt', true) || Date.now();
+            var elapsed = Date.now() - claimedAt;
+            var delay = PowerStation.UNLOCK_DELAY - elapsed;
+            if (delay <= 0) {
+                // 已过 3 分钟, 立即解锁
+                PowerStation.unlockPowerPlant();
+            } else {
+                setTimeout(PowerStation.unlockPowerPlant, delay);
+            }
+        } catch (e) {
+            if (typeof console !== 'undefined' && console.error) {
+                console.error('PowerStation.schedulePowerPlantUnlock error:', e);
+            }
+        }
+    },
+
+    // ── 阶段三开启: 实际解锁发电厂建造 + 显示建造者台词 ──
+    // 设置 game.buildings["diesel generator"] = 1 → Room.craftUnlocked('power plant') 通过门控
+    // 发电厂按钮浮现; 同时立即在左边显示建造者台词 (notify(null,...) = 不进队列, 立即打印)
+    unlockPowerPlant: function() {
+        try {
+            if ($SM.get('game.buildings["diesel generator"]', true)) return;
+            $SM.set('game.buildings["diesel generator"]', 1);
+            Notifications.notify(null, _('建造者说, 村里有了柴油发电机, 也许能建一座真正的发电厂.'));
+        } catch (e) {
+            if (typeof console !== 'undefined' && console.error) {
+                console.error('PowerStation.unlockPowerPlant error:', e);
+            }
+        }
+    },
+
+    // ── 阶段三开启: 带着柴油发电机安全回到家 ──
+    // 注: 不再立即显示建造者台词; 建造者台词改为在取得发电机 3 分钟后由 unlockPowerPlant() 显示
+    onGoHome: function() {
+        try {
+            if (!$SM.get('game.powerStation.generatorObtained', true)) return;
+            if ($SM.get('game.powerStation.safeReturnDone', true)) return;
+            $SM.set('game.powerStation.safeReturnDone', true);
+
+            // 成就【安全归来】(奖励: 柴油 2~6 桶 + 外星合金 x1 + 钢 x100)
+            PowerStation.unlockWithDiesel('power_safe_return',
+                '，外星合金 +1，钢 +100',
+                { 'alien alloy': 1, 'steel': 100 });
+        } catch (e) {
+            if (typeof console !== 'undefined' && console.error) {
+                console.error('PowerStation.onGoHome error:', e);
+            }
+        }
+    },
+
+    // ── 工具: 随机 2~6 桶柴油写入成就奖励并解锁 ──
+    unlockWithDiesel: function(id, extraSubtitle, extraRewards) {
+        try {
+            if (typeof Achievements === 'undefined' || !Achievements.TABLE[id]) return;
+            var n = 2 + Math.floor(Math.random() * 5); // 2~6 桶
+            var rewards = { 'diesel': n };
+            if (extraRewards) {
+                for (var k in extraRewards) {
+                    rewards[k] = extraRewards[k];
+                }
+            }
+            Achievements.TABLE[id].rewards = rewards;
+            Achievements.TABLE[id].subtitle = '柴油 +' + n + (extraSubtitle || '');
+            Achievements.unlock(id);
+        } catch (e) {
+            if (typeof console !== 'undefined' && console.error) {
+                console.error('PowerStation.unlockWithDiesel error:', e);
+            }
+        }
+    }
+};
+
+/**
+ * 阶段一: 停电危机事件链 (三连弹窗)
+ * 不进入随机事件池 — 只由 PowerStation.tick() 每 3 分钟检查、50% 概率触发
+ */
+Events.BlackoutEvent = {
+    title: _('电力中断'),
+    isAvailable: function() {
+        return false; // 永不进入随机事件池, 由专用计时器触发
+    },
+    scenes: {
+        // ---------- 弹窗 1 ----------
+        'start': {
+            text: [
+                _('头顶的灯管突然闪烁了几下, 发出一阵刺耳的嗡鸣.'),
+                _('啪！整个世界陷入了一片漆黑.')
+            ],
+            notification: _('头顶的灯管突然闪烁了几下, 发出一阵刺耳的嗡鸣'),
+            buttons: {
+                'ps_ok1': {
+                    text: _('确定'),
+                    nextScene: {1: 'second'}
+                }
+            }
+        },
+        // ---------- 弹窗 2 ----------
+        'second': {
+            text: [
+                _('你听到远处传来变电器的爆炸声, 空气中弥漫着一股焦糊味.'),
+                _('备用电源已经启动, 但燃料只能维持很短的时间. 你必须在它耗尽之前找到办法.')
+            ],
+            buttons: {
+                'ps_ok2': {
+                    text: _('确定'),
+                    nextScene: {1: 'third'}
+                }
+            }
+        },
+        // ---------- 弹窗 3 ----------
+        'third': {
+            text: [
+                _('你必须找到备用发电机的位置, 但记忆中它似乎在镇子边缘的废弃发电站里, 你需要外出探索.')
+            ],
+            onLoad: function() {
+                // 标记停电事件完成, 并在探险地图上标记 E
+                PowerStation.completeBlackout();
+            },
+            buttons: {
+                'ps_ok3': {
+                    text: _('确定'),
+                    nextScene: 'end'
+                }
+            }
+        }
+    }
+};
+
+// 自动启动 (文档就绪后, 与 Achievements 同步初始化)
+if (typeof $ !== 'undefined') {
+    $(function(){
+        if (typeof $SM !== 'undefined' && typeof World !== 'undefined') {
+            PowerStation.init();
         }
     });
 }
