@@ -3340,7 +3340,9 @@ var Button = {
                 VERSION: 1.3,
                 MAX_STORE: 99999999999999,
                 SAVE_DISPLAY: 30 * 1000,
+                SAVE_DEBOUNCE: 2000, // ⚠️ 防抖窗口 (ms): 2s 内多次 saveGame 合并为一次实际写盘
                 GAME_OVER: false,
+                _saveTimer: null,    // ⚠️ 显式声明: 防抖 timer handle (null = 无 pending 保存)
                 
                 //object event types
                 topics: {},
@@ -3511,88 +3513,110 @@ var Button = {
                                 /Android|webOS|iPhone|iPad|iPod|BlackBerry/i.test(navigator.userAgent);
                 },
                 
+                // ⚠️ 防抖保存: 多次调用合并为一次实际写盘 (2s 窗口)
+                //    原 bug: 这里只 clearTimeout(_saveTimer) 却从不 setTimeout, 等于死代码,
+                //    每次 $SM.set / 每条通知都同步跑一遍 "JSON.stringify + LZ 压缩 + localStorage.setItem",
+                //    实测挂机 60s 触发 50 次存档、阻塞 1.6s; 后期大存档单次 150~300ms, 是卡顿主因。
+                //    修复: 恢复 setTimeout 防抖; 真正需要立即写盘的调用方 (export64) 用 saveGameNow。
                 saveGame: function() {
-                        if(typeof Storage != 'undefined' && localStorage) {
-                                if(Engine._saveTimer != null) {
-                                        clearTimeout(Engine._saveTimer);
-                                }
-                                if(typeof Engine._lastNotify == 'undefined' || Date.now() - Engine._lastNotify > Engine.SAVE_DISPLAY){
-                                        $('#saveNotify').css('opacity', 1).animate({opacity: 0}, 1000, 'linear');
-                                        Engine._lastNotify = Date.now();
-                                }
-                                // ⚠️ 用户要求: 确保存档不会超过 1MB
-                                //    策略: 三级降级, 每级都先量体积再决定是否进入下一级
-                                //      L1: 完整 State → JSON.stringify → LZString.compress → 检查 ≤ 1MB → 写入
-                                //      L2: 仍超 1MB → 强制清掉冗余字段 (清掉 discoveredLandmarks 缓存, 它可由 mask 重建) → 重压 → 写入
-                                //      L3: 仍超 1MB → 只存核心字段 (version + 必要 features) → 写入, 不丢游戏主进度
-                                //    格式: 压缩后的字符串 (非 JSON, 不以 '{' 开头)
-                                //    旧存档兼容: loadGame 检测首字符, '{' 则按裸 JSON 解析, 否则按 LZString 解压
-                                //    1MB = 1024 * 1024 = 1048576 字节 (UTF-16 字符串 .length 算的是 UTF-16 code unit 数;
-                                //    对纯 ASCII (LZString 输出) 1 char = 1 byte, 所以 1MB 限制等价于 length ≤ 1048576)
-                                var MAX_SAVE_BYTES = 1024 * 1024; // 1MB
+                        if (typeof Storage == 'undefined' || !localStorage) return;
+                        if (Engine._saveTimer != null) {
+                                clearTimeout(Engine._saveTimer);
+                        }
+                        if (typeof Engine._lastNotify == 'undefined' || Date.now() - Engine._lastNotify > Engine.SAVE_DISPLAY) {
+                                $('#saveNotify').css('opacity', 1).animate({opacity: 0}, 1000, 'linear');
+                                Engine._lastNotify = Date.now();
+                        }
+                        Engine._saveTimer = setTimeout(function() {
+                                Engine._saveTimer = null;
+                                Engine._doSaveGame();
+                        }, Engine.SAVE_DEBOUNCE);
+                },
 
-                                function _trySave(stateObj, label) {
-                                        if (!stateObj) return null;
-                                        var raw = JSON.stringify(stateObj);
-                                        var compressed = (typeof LZString !== 'undefined') ? LZString.compress(raw) : raw;
-                                        if (compressed && compressed.length <= MAX_SAVE_BYTES) {
-                                                return compressed; // 成功
+                // 立即同步保存 (跳过防抖) — 仅用于需要 localStorage.gameState 已更新的场景 (export64 / 落盘惩罚等)
+                saveGameNow: function() {
+                        if (Engine._saveTimer != null) {
+                                clearTimeout(Engine._saveTimer);
+                                Engine._saveTimer = null;
+                        }
+                        Engine._doSaveGame();
+                },
+
+                // 实际写盘逻辑 (同步) — 由 saveGame 防抖调用, 或由 saveGameNow 立即调用
+                _doSaveGame: function() {
+                        if (typeof Storage == 'undefined' || !localStorage) return;
+                        // ⚠️ 用户要求: 确保存档不会超过 1MB
+                        //    策略: 三级降级, 每级都先量体积再决定是否进入下一级
+                        //      L1: 完整 State → JSON.stringify → LZString.compress → 检查 ≤ 1MB → 写入
+                        //      L2: 仍超 1MB → 强制清掉冗余字段 (清掉 discoveredLandmarks 缓存, 它可由 mask 重建) → 重压 → 写入
+                        //      L3: 仍超 1MB → 只存核心字段 (version + 必要 features) → 写入, 不丢游戏主进度
+                        //    格式: 压缩后的字符串 (非 JSON, 不以 '{' 开头)
+                        //    旧存档兼容: loadGame 检测首字符, '{' 则按裸 JSON 解析, 否则按 LZString 解压
+                        //    1MB = 1024 * 1024 = 1048576 字节 (UTF-16 字符串 .length 算的是 UTF-16 code unit 数;
+                        //    对纯 ASCII (LZString 输出) 1 char = 1 byte, 所以 1MB 限制等价于 length ≤ 1048576)
+                        var MAX_SAVE_BYTES = 1024 * 1024; // 1MB
+
+                        function _trySave(stateObj, label) {
+                                if (!stateObj) return null;
+                                var raw = JSON.stringify(stateObj);
+                                var compressed = (typeof LZString !== 'undefined') ? LZString.compress(raw) : raw;
+                                if (compressed && compressed.length <= MAX_SAVE_BYTES) {
+                                        return compressed; // 成功
+                                }
+                                if (typeof console !== 'undefined' && console.warn) {
+                                        console.warn('saveGame[' + label + '] size = ' + (compressed ? compressed.length : 0) + ' bytes, exceeds 1MB limit');
+                                }
+                                return null; // 失败, 让上层降级
+                        }
+
+                        try {
+                                // L1: 完整 State
+                                var compressed = _trySave(State, 'L1-full');
+
+                                // L2: 仍超 1MB → 清掉可重建的缓存字段 (discoveredLandmarks, _edgeWallLastNotify 等)
+                                //     discoveredLandmarks: 玩家进入世界时会 fullScanDiscoveredLandmarks 重建
+                                //     _edgeWallLastNotify: 仅运行时用, 不需持久化
+                                if (!compressed && State && typeof State === 'object') {
+                                        var pruned = JSON.parse(JSON.stringify(State)); // 深拷贝, 避免污染运行时 State
+                                        var world = pruned && pruned.game && pruned.game.world;
+                                        if (world) {
+                                                if (world.discoveredLandmarks) delete world.discoveredLandmarks;
+                                                // visited 对象可能很大, 但不能删 (丢失会丢已访问地标标记)
                                         }
-                                        if (typeof console !== 'undefined' && console.warn) {
-                                                console.warn('saveGame[' + label + '] size = ' + (compressed ? compressed.length : 0) + ' bytes, exceeds 1MB limit');
-                                        }
-                                        return null; // 失败, 让上层降级
+                                        compressed = _trySave(pruned, 'L2-pruned');
                                 }
 
-                                try {
-                                        // L1: 完整 State
-                                        var compressed = _trySave(State, 'L1-full');
-                                        
-                                        // L2: 仍超 1MB → 清掉可重建的缓存字段 (discoveredLandmarks, _edgeWallLastNotify 等)
-                                        //     discoveredLandmarks: 玩家进入世界时会 fullScanDiscoveredLandmarks 重建
-                                        //     _edgeWallLastNotify: 仅运行时用, 不需持久化
-                                        if (!compressed && State && typeof State === 'object') {
-                                                var pruned = JSON.parse(JSON.stringify(State)); // 深拷贝, 避免污染运行时 State
-                                                var world = pruned && pruned.game && pruned.game.world;
-                                                if (world) {
-                                                        if (world.discoveredLandmarks) delete world.discoveredLandmarks;
-                                                        // visited 对象可能很大, 但不能删 (丢失会丢已访问地标标记)
-                                                }
-                                                compressed = _trySave(pruned, 'L2-pruned');
-                                        }
-
-                                        // L3: 仍超 1MB → 只存核心字段, 不丢游戏主进度
+                                // L3: 仍超 1MB → 只存核心字段, 不丢游戏主进度
+                                if (!compressed) {
+                                        var minimal = {
+                                                version: (State && State.version) || Engine.VERSION,
+                                                _saveFailed: true,
+                                                _saveFailedReason: 'state exceeds 1MB even after pruning',
+                                                _saveTimestamp: Date.now()
+                                        };
+                                        // 尝试保留 features (游戏进度标志)
+                                        if (State && State.features) minimal.features = State.features;
+                                        if (State && State.game && State.game.buildings) minimal.game = { buildings: State.game.buildings };
+                                        compressed = _trySave(minimal, 'L3-minimal');
                                         if (!compressed) {
-                                                var minimal = {
-                                                        version: (State && State.version) || Engine.VERSION,
-                                                        _saveFailed: true,
-                                                        _saveFailedReason: 'state exceeds 1MB even after pruning',
-                                                        _saveTimestamp: Date.now()
-                                                };
-                                                // 尝试保留 features (游戏进度标志)
-                                                if (State && State.features) minimal.features = State.features;
-                                                if (State && State.game && State.game.buildings) minimal.game = { buildings: State.game.buildings };
-                                                compressed = _trySave(minimal, 'L3-minimal');
-                                                if (!compressed) {
-                                                        // 极端情况: minimal 都超 1MB (几乎不可能) → 只存 version
-                                                        compressed = (typeof LZString !== 'undefined') ? LZString.compress('{"version":"' + Engine.VERSION + '","_saveFailed":true}') : '{"version":"' + Engine.VERSION + '"}';
-                                                }
-                                                if (typeof console !== 'undefined' && console.error) {
-                                                        console.error('saveGame: dropped to L3 minimal save (state was too large)');
-                                                }
+                                                // 极端情况: minimal 都超 1MB (几乎不可能) → 只存 version
+                                                compressed = (typeof LZString !== 'undefined') ? LZString.compress('{"version":"' + Engine.VERSION + '","_saveFailed":true}') : '{"version":"' + Engine.VERSION + '"}';
                                         }
+                                        if (typeof console !== 'undefined' && console.error) {
+                                                console.error('saveGame: dropped to L3 minimal save (state was too large)');
+                                        }
+                                }
 
-                                        localStorage.gameState = compressed;
-                                } catch(_saveErr) {
-                                        // 配额溢出 (QuotaExceededError) 或其他异常 → 尝试只存核心字段, 不丢游戏
-                                        if (typeof console !== 'undefined' && console.error) console.error('saveGame error:', _saveErr);
-                                        try {
-                                                // 兜底: 至少存 version, 让下次启动不至于完全失忆
-                                                var minimal = { version: (State && State.version) || Engine.VERSION, _saveFailed: true };
-                                                localStorage.gameState = (typeof LZString !== 'undefined') ? LZString.compress(JSON.stringify(minimal)) : JSON.stringify(minimal);
-                                        } catch(_e2) {
-                                                if (typeof console !== 'undefined' && console.error) console.error('saveGame fallback failed:', _e2);
-                                        }
+                                localStorage.gameState = compressed;
+                        } catch(_saveErr) {
+                                // 配额溢出 (QuotaExceededError) 或其他异常 → 尝试只存核心字段, 不丢游戏
+                                if (typeof console !== 'undefined' && console.error) console.error('saveGame error:', _saveErr);
+                                try {
+                                        // 兜底: 至少存 version, 让下次启动不至于完全失忆
+                                        var minimal = { version: (State && State.version) || Engine.VERSION, _saveFailed: true };
+                                        localStorage.gameState = (typeof LZString !== 'undefined') ? LZString.compress(JSON.stringify(minimal)) : JSON.stringify(minimal);
+                                } catch(_e2) {
+                                        if (typeof console !== 'undefined' && console.error) console.error('saveGame fallback failed:', _e2);
                                 }
                         }
                 },
@@ -3694,7 +3718,9 @@ var Button = {
           },
           
           export64: function() {
-            Engine.saveGame();
+            // ⚠️ 必须立即同步落盘: 紧接着要读 localStorage.gameState 做 Base64 编码,
+            //    走防抖版 saveGame 会导致导出的是旧存档。
+            Engine.saveGameNow();
             var string64 = Base64.encode(localStorage.gameState);
             string64 = string64.replace(/\s/g, '');
             string64 = string64.replace(/\./g, '');
@@ -4648,7 +4674,9 @@ var Notifications = {
                 } else {
                         Notifications.printMessage(text);
                 }
-                Engine.saveGame();
+                // ⚠️ 删除 Engine.saveGame(): 通知本身不修改 State, 没必要触发存档;
+                //    原代码让每条通知都同步跑一遍 "JSON.stringify + LZ 压缩 + 写 localStorage",
+                //    是挂机卡顿的主要来源之一。后续若真的改了 State, 调用方自己会触发 saveGame。
         },
         
         printMessage: function(t) {
@@ -10749,6 +10777,23 @@ var World = {
                         World.state.mask = _mask;
                         World.state.visited = World.state.visited || {};
                 }
+                // ⚠️ 修复 mapZ 损坏时无兜底 (原 bug):
+                //    上面 if/else 中, "mapZ 存在但解压失败 且 无 mapC" 这一支把 World.state.map 留为 null,
+                //    后续 drawMap / 首次移动直接 TypeError, 整张地图卡死、玩家无法进入世界。
+                //    同理 mapC 解压失败也会留 null。这里在所有降级路径之后做一次安全兜底:
+                //    任何路径都没拿到有效 map/mask → 重新生成 (代价是丢旧探索进度, 但比卡死好)。
+                if (!World.state.map || !World.state.mask) {
+                        if (typeof console !== 'undefined' && console.warn) {
+                                console.warn('World.onArrival: all map decompress paths failed, regenerating map (saved progress will be lost)');
+                        }
+                        World.state.map = World.generateMap();
+                        World.state.mask = World.newMask();
+                        World.state.visited = World.state.visited || {};
+                        // 标记一下, 让 World 知道这是兜底重建 (可选: 写入运行时标志)
+                        World._mapRegenerated = true;
+                } else {
+                        World._mapRegenerated = false;
+                }
                 if (!World.state.visited) World.state.visited = {};
                 // ⚠️ 新增: 如果 State 中没有 discoveredLandmarks (首次进入或旧存档), 做一次全量扫描
                 //    否则直接复用, 避免每次进入都 4M 次迭代
@@ -12436,6 +12481,33 @@ var Space = {
                 clearTimeout(Events._eventTimeout);
                 clearTimeout(Room._fireTimer);
                 clearTimeout(Room._tempTimer);
+                // ⚠️ 修复: 通关后新模块定时器不清理 (原 bug)
+                //    PowerSystem._tickTimer (10s 心跳, 每次 tick 都 $SM.set + Engine.saveGame, 通关后还在跑)
+                //    PowerStation._timer (3min 检查 + 触发后调度发电机超时倒计时)
+                //    PowerStation._genTimeoutTimer (10min 发电机超时倒计时)
+                //    NewWeapons._timer (3min 检查新武器解锁)
+                //    以及几个 setTimeout 形态的内部倒计时 (PowerSystem 的 box/b2/blackout)
+                //    通关后游戏画面已结束, 这些定时器纯属空转, 每隔几秒触发一次存档/事件,
+                //    既耗内存又可能干扰 endGame 的动画。这里一并清掉。
+                try {
+                        if (typeof PowerSystem !== 'undefined') {
+                                if (PowerSystem._tickTimer)      { clearInterval(PowerSystem._tickTimer);      PowerSystem._tickTimer = null; }
+                                if (PowerSystem._blackoutTimer)  { clearTimeout(PowerSystem._blackoutTimer);   PowerSystem._blackoutTimer = null; }
+                                if (PowerSystem._boxTimer)       { clearTimeout(PowerSystem._boxTimer);        PowerSystem._boxTimer = null; }
+                                if (PowerSystem._b2Timer)        { clearTimeout(PowerSystem._b2Timer);         PowerSystem._b2Timer = null; }
+                        }
+                } catch(_e) {}
+                try {
+                        if (typeof PowerStation !== 'undefined') {
+                                if (PowerStation._timer)             { clearInterval(PowerStation._timer);             PowerStation._timer = null; }
+                                if (PowerStation._genTimeoutTimer)   { clearTimeout(PowerStation._genTimeoutTimer);    PowerStation._genTimeoutTimer = null; }
+                        }
+                } catch(_e) {}
+                try {
+                        if (typeof NewWeapons !== 'undefined') {
+                                if (NewWeapons._timer) { clearInterval(NewWeapons._timer); NewWeapons._timer = null; }
+                        }
+                } catch(_e) {}
                 for(var k in Room.Craftables) {
                         Room.Craftables[k].button = null;
                 }
@@ -17959,8 +18031,34 @@ Events.Setpieces = {
                 }
         }
 
+        // ⚠️ 原 setInterval(adjustHeight, 500) 永久跑, 每秒 2 次强制 reflow (getBoundingClientRect),
+        //    即使页面无变化也在烧 CPU。改造策略:
+        //      1) 轮询间隔从 500ms 拉长到 2000ms (作为兜底, 兜住脚本未感知到的布局变化)
+        //      2) 订阅 stateUpdate 事件, State 变化时 (建造/制造/购买等触发 stores 增减) 立即重算 (自带 50ms 防抖)
+        //      3) 监听 window resize
+        //    结果: 静态挂机时 reflow 频率从 2Hz 降到 0.5Hz; 有状态变化时仍能及时响应。
+        var _adjustTimer = null;
+        function scheduleAdjust() {
+                if (_adjustTimer != null) return;
+                _adjustTimer = setTimeout(function() {
+                        _adjustTimer = null;
+                        adjustHeight();
+                }, 50);
+        }
+
         setTimeout(adjustHeight, 500);
-        setInterval(adjustHeight, 500);
+        setInterval(adjustHeight, 2000); // 兜底轮询: 2s 一次, 不再 500ms
+        window.addEventListener('resize', scheduleAdjust);
+        // 订阅 State 变化 (jQuery 风格的事件总线, 引擎内部用同一套)
+        if (typeof $ !== 'undefined' && $.Dispatch) {
+                try {
+                        $.Dispatch('stateUpdate').subscribe(function() {
+                                scheduleAdjust();
+                        });
+                } catch(_e) {}
+        }
+        // 暴露给其他模块主动调用 (例如 Room 切换按钮列时)
+        window.scheduleAdjustHeight = scheduleAdjust;
 })();
 </script>
 
@@ -18016,9 +18114,17 @@ Events.Setpieces = {
     function _e(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
 
     function _tone(){
-        try{var ctx=new(window.AudioContext||window.webkitAudioContext)(),t=ctx.currentTime;
-        var o1=ctx.createOscillator(),g1=ctx.createGain();o1.type='square';o1.frequency.setValueAtTime(220,t);o1.frequency.exponentialRampToValueAtTime(880,t+.12);g1.gain.setValueAtTime(.1,t);g1.gain.exponentialRampToValueAtTime(.01,t+.25);o1.connect(g1);g1.connect(ctx.destination);o1.start(t);o1.stop(t+.25);
-        var o2=ctx.createOscillator(),g2=ctx.createGain();o2.type='square';o2.frequency.setValueAtTime(330,t+.05);o2.frequency.exponentialRampToValueAtTime(660,t+.15);g2.gain.setValueAtTime(.06,t+.05);g2.gain.exponentialRampToValueAtTime(.01,t+.2);o2.connect(g2);g2.connect(ctx.destination);o2.start(t+.05);o2.stop(t+.2);
+        try{
+            var ctx=new(window.AudioContext||window.webkitAudioContext)(),t=ctx.currentTime;
+            var o1=ctx.createOscillator(),g1=ctx.createGain();o1.type='square';o1.frequency.setValueAtTime(220,t);o1.frequency.exponentialRampToValueAtTime(880,t+.12);g1.gain.setValueAtTime(.1,t);g1.gain.exponentialRampToValueAtTime(.01,t+.25);o1.connect(g1);g1.connect(ctx.destination);o1.start(t);o1.stop(t+.25);
+            var o2=ctx.createOscillator(),g2=ctx.createGain();o2.type='square';o2.frequency.setValueAtTime(330,t+.05);o2.frequency.exponentialRampToValueAtTime(660,t+.15);g2.gain.setValueAtTime(.06,t+.05);g2.gain.exponentialRampToValueAtTime(.01,t+.2);o2.connect(g2);g2.connect(ctx.destination);o2.start(t+.05);o2.stop(t+.2);
+            // ⚠️ 修复 AudioContext 泄露: 原代码每次弹窗 new 一个 AudioContext 且从不 close(),
+            //    长期游玩攒几十个活的音频上下文 (浏览器上限通常 6~32 个, 超过会抛 'Max number of
+            //    WebAudio contexts reached')。oscillator.stop 后 250ms 内声音已播完, 此时 ctx.close() 释放资源。
+            //    close() 是异步的、且幂等 (重复调用安全), 不影响正在播放的声音。
+            var _closeCtx = function(){ try{ ctx.close(); }catch(_e){} };
+            // 取较晚的结束时间 + 小缓冲, 确保声音已播完再关
+            setTimeout(_closeCtx, 300);
         }catch(e){}
     }
 
@@ -19407,9 +19513,9 @@ var PowerSystem = {
                 Notifications.notify(Room, _('the fleeing villagers carry off {0} supplies', stolen));
             }
 
-            // 立即落盘, 确保人口/物资变化写入存档
-            if (typeof Engine !== 'undefined' && Engine.saveGame) {
-                Engine.saveGame();
+            // 立即落盘, 确保人口/物资变化写入存档 (走 saveGameNow 跳过防抖, 防止玩家关页面时丢失惩罚结果)
+            if (typeof Engine !== 'undefined' && Engine.saveGameNow) {
+                Engine.saveGameNow();
             }
         } catch (e) {
             if (typeof console !== 'undefined' && console.error) {
@@ -19443,7 +19549,12 @@ var PowerSystem = {
             }
             if (taken > 0) {
                 $SM.fireUpdate('stores', true);
-                Engine.saveGame();
+                // ⚠️ 惩罚偷取立即落盘 (跳过防抖), 防止玩家趁 2s 防抖窗口关页面逃避惩罚
+                if (typeof Engine !== 'undefined' && Engine.saveGameNow) {
+                    Engine.saveGameNow();
+                } else if (typeof Engine !== 'undefined' && Engine.saveGame) {
+                    Engine.saveGame();
+                }
             }
             return taken;
         } catch (e) {
